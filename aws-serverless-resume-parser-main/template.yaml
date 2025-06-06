@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  resume-parser-app
+
+# Parameters require while creating resources
+Parameters:
+  APIGatewayStageName:
+    Description: Specify stage name for api gateway
+    Type: String
+    AllowedValues:
+      - prod
+      - dev
+      - test
+    Default: dev
+
+  ResumeStoreDBName:
+    Description: Specify dynamo db name
+    Type: String
+    Default: StoreResumeData
+
+  Debug:
+    Description: Debug value
+    Type: String
+    AllowedValues:
+      - 0
+      - 1
+    Default: 1
+  
+  ApiUrl:
+    Description: Specify api for resume parser
+    Type: String
+
+  ApiKey:
+    Description: Specify apikey for resume parser
+    Type: String
+
+
+Resources:
+
+  # Execution role will be used by lambda function for uploading files on s3
+  UploadToS3ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      RoleName: UploadToS3ExecutionRole
+
+  # Execution role will be used by lambda function for process resume api
+  ProcessResumeLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      RoleName: ProcessResumeLambdaExecutionRole
+
+  # Execution role will be used by lambda function for get resume api
+  GetResumeLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      RoleName: GetResumeLambdaExecutionRole
+
+  # Policy to upload file on s3
+  UploadToS3ExecutionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaPutObjectPolicy
+      Roles: 
+        - !Ref UploadToS3ExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource: "*"
+
+  # Policy used by lambda functions to upload logs in cloudwatch
+  UploadLambdaLogs:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaPutLogsPolicy
+      Roles:
+        - !Ref UploadToS3ExecutionRole
+        - !Ref ProcessResumeLambdaExecutionRole
+        - !Ref GetResumeLambdaExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: "*"
+
+  GetResumeS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: GetResumeS3Policy
+      Roles:
+        - !Ref ProcessResumeLambdaExecutionRole
+        - !Ref GetResumeLambdaExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: "*"
+
+  # Policy will be used by process resume api lambda 
+  PutResumeDynamoDBPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: PutResumeDynamoDBPolicy
+      Roles:
+        - !Ref ProcessResumeLambdaExecutionRole
+        - !Ref GetResumeLambdaExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:GetItem
+              - dynamodb:Scan
+            Resource: "*"
+
+  # Common layer for all lambda functions with required python packages
+  ResumeParserLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: resume-parser-layer
+      Description: All required packages for resume parser project
+      ContentUri: resume-parser-layer.zip
+
+  ProcessResumeLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: process-resume-events
+      CodeUri: lambda_code/
+      Handler: process_s3_events.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt ProcessResumeLambdaExecutionRole.Arn
+      Timeout: 100
+      Environment:
+        Variables:
+          DEBUG: !Ref Debug
+          API_URL: !Ref ApiUrl
+          API_KEY: !Ref ApiKey
+          STORE_TABLE_NAME: !Ref ResumeStoreDBName
+      Layers:
+        - !Ref ResumeParserLayer
+
+  # Permission needed for s3 for invoking lambda function
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessResumeLambdaFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt StoreBucket.Arn
+
+  StoreBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StoreBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Join
+                        - '/'
+                        - - !GetAtt StoreBucket.Arn
+                          - '*'
+            Principal: '*'
+
+  StoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+                    - '-'
+                    - - 'resume-parser'
+                      - !Ref AWS::Region
+                      - !Ref AWS::AccountId
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          # Invoke lambda function when object is created
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt ProcessResumeLambdaFunction.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  UploadToS3LambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: upload-resume-to-s3
+      CodeUri: lambda_code/
+      Handler: upload_to_s3.lambda_handler
+      Runtime: python3.8
+      Events:
+        UploadToS3:
+          Type: Api
+          Properties:
+            Path: /upload-resume
+            Method: POST
+            RestApiId: !Ref ResumeAPI
+      Role: !GetAtt UploadToS3ExecutionRole.Arn
+      Environment:
+        Variables:
+          UPLOAD_S3_NAME: !Ref StoreBucket
+      Layers:
+        - !Ref ResumeParserLayer
+
+  ResumeAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: resume-parser-api
+      StageName: !Ref APIGatewayStageName
+      BinaryMediaTypes:
+        - 'application/pdf'
+
+  # Dynamo db to store data points extracted from resume
+  ResumeDynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref ResumeStoreDBName
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: cr_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: cr_timestamp
+          KeyType: RANGE
+      ProvisionedThroughput: 
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  # Api for getting resume data stored in dynamo db and s3
+  GetResumeLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: get-resumes
+      CodeUri: lambda_code/
+      Handler: get_resumes.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt GetResumeLambdaExecutionRole.Arn
+      Events:
+        GetResume:
+          Type: Api
+          Properties:
+            Method: GET
+            Path: /get-resume
+            RestApiId: !Ref ResumeAPI
+      Environment:
+        Variables:
+          UPLOAD_S3_NAME: !Ref StoreBucket
+          STORE_TABLE_NAME: !Ref ResumeStoreDBName
+      Layers:
+        - !Ref ResumeParserLayer
